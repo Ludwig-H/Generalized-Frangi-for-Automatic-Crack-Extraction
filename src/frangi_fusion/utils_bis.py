@@ -56,8 +56,8 @@ def to_gray_uint8(img):
 
 # ---------- monkey-patch repo utilities if present ----------
 try:
-    import frangi_fusion.utils as U
-    import frangi_fusion.hessian as H
+    import .utils as U
+    import .hessian as H
     # patch readers / grayscale
     U._read_image = _read_image_any
     U.to_gray_uint8 = to_gray_uint8
