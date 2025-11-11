@@ -7,3 +7,4 @@ from .mst_kcenters import mst_on_cluster, kcenters_on_tree, fault_graph_from_mst
 from .metrics import skeletonize_lee, jaccard_index, tversky_index, wasserstein_distance_skeletons, thicken
 from .visualization import overlay_hessian_orientation, show_clusters_on_image, animate_fault_growth
 from .utils import set_seed, auto_discover_find_structure, load_modalities_and_gt_by_index
+from .utils_bis import _read_image_any, to_gray_uint8, _to_gray_float01, _is_image_file, _extract_key, auto_discover_find_structure, load_modalities_and_gt_by_index
