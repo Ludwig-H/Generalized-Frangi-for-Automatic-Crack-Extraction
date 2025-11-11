@@ -2,55 +2,48 @@
 """
 Sparse HDBSCAN on a CSR precomputed distance graph.
 
-This module runs a HDBSCAN-like pipeline directly on a sparse distance graph:
-  1) compute k-core distances per node from its existing sparse neighbors
-  2) mutual reachability on existing edges only: mr(i,j)=max(core[i], core[j], d_ij)
-  3) MST on the sparse MR graph (SciPy csgraph)
-  4) build single-linkage merge tree; accumulate cluster stability
-  5) simplified EOM selection: pick children if their total stability exceeds the parent's,
-     subject to min_cluster_size. Otherwise pick the parent. Unselected points -> noise (-1).
+Pipeline (entièrement sparse):
+  1) core-distances: k-ième voisin (sur le graphe existant)
+  2) mutual reachability sur le motif sparse : mr(i,j)=max(core[i], core[j], d_ij)
+  3) MST (SciPy) sur MR
+  4) arbre de fusions single-linkage + stabilité
+  5) sélection EOM (itérative, sans récursion)
+  6) labels; -1 = bruit
 
-This avoids ever materializing an NxN dense matrix.
-
-Notes:
-- Input matrix must be symmetric distances (we symmetrize defensively).
-- Dtype is forced to float64 to match the C backends used in MST routines.
+Entrée: CSR de distances symétrique (ou sera symétrisée).
+Dtype: float64 du début à la fin (sinon MST râle).
 """
 
 from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
-from scipy.sparse import csr_matrix, coo_matrix
+from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree
 
-# -------------------- utilities --------------------
+
+# -------------------- utils --------------------
 
 def _symmetrize_min_csr(D: csr_matrix) -> csr_matrix:
-    """Return a symmetric CSR by taking the elementwise min between D and D.T."""
+    """Symétrise via min(D, D.T) + comble les arêtes unilatérales."""
+    D = D.tocsr()
     DT = D.T.tocsr()
-    # Keep entries that exist in either; for duplicates take min
-    A = D.minimum(DT)  # elementwise min on overlap
-    # For one-sided edges, fill with the other side value
-    B = D.maximum(DT)  # has all edges present on at least one side
-    # Where A has zeros but B has nonzeros, use B
+    A = D.minimum(DT)
+    B = D.maximum(DT)
+    # A a les minima sur les arêtes communes; on ajoute les arêtes unilatérales depuis B
     A = A + (B - A).maximum(0)
     A.eliminate_zeros()
     return A.tocsr()
 
 def _kth_smallest_positive(values: np.ndarray, k: int) -> float:
-    """k-th smallest strictly positive value in 1D array; fallback to max if not enough."""
     vals = values[values > 0]
     if vals.size == 0:
         return np.inf
     if vals.size < k:
         return float(np.max(vals))
-    # partition is O(n)
-    kth = np.partition(vals, k-1)[k-1]
-    return float(kth)
+    return float(np.partition(vals, k-1)[k-1])
 
 def _core_distances_from_csr(D: csr_matrix, k: int) -> np.ndarray:
-    """Core distance of each node = distance to its k-th nearest neighbor among existing edges."""
     n = D.shape[0]
     core = np.empty(n, dtype=np.float64)
     indptr, data = D.indptr, D.data
@@ -60,7 +53,6 @@ def _core_distances_from_csr(D: csr_matrix, k: int) -> np.ndarray:
     return core
 
 def _mutual_reachability_csr(D: csr_matrix, core: np.ndarray) -> csr_matrix:
-    """Mutual reachability on the same sparsity pattern as D."""
     D = D.tocsr()
     indptr, indices, data = D.indptr, D.indices, D.data
     out_data = np.empty_like(data, dtype=np.float64)
@@ -68,25 +60,37 @@ def _mutual_reachability_csr(D: csr_matrix, core: np.ndarray) -> csr_matrix:
         s, e = indptr[i], indptr[i+1]
         js = indices[s:e]
         dij = data[s:e]
-        # mr(i,j) = max(core[i], core[j], d_ij)
         out_data[s:e] = np.maximum(np.maximum(core[i], core[js]), dij)
     MR = csr_matrix((out_data, indices.copy(), indptr.copy()), shape=D.shape)
     MR.eliminate_zeros()
     return MR
 
-# -------------------- HDBSCAN via MST --------------------
+def _mst_edges_from_sparse(MR: csr_matrix) -> List[Tuple[int,int,float]]:
+    """Renvoie la liste d'arêtes (i,j,w) du MST (non orienté), triée par poids croissant."""
+    MST = minimum_spanning_tree(MR)  # float64 CSR
+    coo = MST.tocoo()
+    edges = {(int(i), int(j)): float(w) for i, j, w in zip(coo.row, coo.col, coo.data)}
+    undirected = []
+    for (i, j), w in edges.items():
+        if (j, i) in edges:
+            w = min(w, edges[(j, i)])
+        undirected.append((i, j, w))
+    undirected.sort(key=lambda t: t[2])
+    return undirected
+
+
+# -------------------- arbre de clusters --------------------
 
 @dataclass
 class ClusterNode:
     id: int
-    left: int  # child cluster id or -1
-    right: int
-    parent: int  # parent cluster id or -1
+    parent: int
     size: int
-    birth_lambda: float   # lambda at which this cluster exists (1/d)
-    last_lambda: float    # last processed lambda for stability accumulation
+    birth_lambda: float
+    last_lambda: float
     stability: float
-    members: set          # set of point indices in this cluster
+    # pour l'étiquetage final; on évite les récursions, donc on garde les membres
+    members: set
 
 class UnionFind:
     def __init__(self, n: int):
@@ -100,202 +104,188 @@ class UnionFind:
             a = p[a]
         return a
 
-    def union(self, a: int, b: int) -> Tuple[int, bool]:
+    def union(self, a: int, b: int) -> int:
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
-            return ra, False
+            return ra
         if self.sz[ra] < self.sz[rb]:
             ra, rb = rb, ra
         self.parent[rb] = ra
         self.sz[ra] += self.sz[rb]
-        return ra, True
+        return ra
 
-def _mst_edges_from_sparse(MR: csr_matrix) -> List[Tuple[int,int,float]]:
-    """Compute MST on MR and return list of undirected edges (i,j,w) sorted by w ascending."""
-    # SciPy returns a directed tree; take upper/lower, then unify
-    MST = minimum_spanning_tree(MR)  # works on CSR, yields CSR with float64
-    # unify both directions
-    coo = MST.tocoo()
-    edges = {(int(i), int(j)): float(w) for i, j, w in zip(coo.row, coo.col, coo.data)}
-    # ensure symmetry (MST is effectively undirected)
-    undirected = []
-    for (i, j), w in edges.items():
-        if (j, i) in edges:
-            w = min(w, edges[(j, i)])
-        undirected.append((i, j, w))
-    undirected.sort(key=lambda t: t[2])  # by weight ascending
-    return undirected
-
-def _build_cluster_tree_from_mst(n: int, mst_edges: List[Tuple[int,int,float]],
-                                 min_cluster_size: int) -> Tuple[List[ClusterNode], int]:
+def _build_tree_single_linkage(n: int, mst_edges: List[Tuple[int,int,float]], min_cluster_size: int):
     """
-    Kruskal over MST edges to build single-linkage tree with stability accumulation.
-    lambdas are 1/w (infinite at start).
-    Returns (nodes, root_id).
+    Kruskal sur MST, accumulation de stabilité. On crée un nouveau noeud parent à chaque fusion.
+    Retourne (nodes, root_id, parent_to_children)
     """
-    # initialize singletons
     nodes: List[ClusterNode] = []
-    point2cid = np.arange(n, dtype=np.int64)  # initial cluster id == point id
+    # clusters init = singletons
+    point_cid = np.arange(n, dtype=np.int64)  # cluster-id courant par UF root index
+    uf = UnionFind(n)
     for i in range(n):
         nodes.append(ClusterNode(
-            id=i, left=-1, right=-1, parent=-1, size=1,
-            birth_lambda=np.inf, last_lambda=np.inf, stability=0.0, members={i}
+            id=i, parent=-1, size=1,
+            birth_lambda=np.inf, last_lambda=np.inf, stability=0.0,
+            members={i}
         ))
 
-    uf = UnionFind(n)
     next_cid = n
+    # On a besoin d'un mapping UF root -> cluster-id courant
+    root2cid = {i: i for i in range(n)}
 
     for i, j, w in mst_edges:
-        # skip pathological zeros
         w = float(w) if w > 0 else 1e-12
         lam = 1.0 / w
 
         ri, rj = uf.find(i), uf.find(j)
         if ri == rj:
             continue
-
-        ci, cj = point2cid[ri], point2cid[rj]
+        ci, cj = root2cid[ri], root2cid[rj]
         ni, nj = nodes[ci], nodes[cj]
 
-        # accumulate stability for children up to current lambda
+        # accumulate stability jusqu'à lam
         ni.stability += ni.size * (ni.last_lambda - lam)
         nj.stability += nj.size * (nj.last_lambda - lam)
         ni.last_lambda = lam
         nj.last_lambda = lam
 
-        # create parent cluster
+        # fusion -> parent
         parent_cid = next_cid; next_cid += 1
         members = ni.members | nj.members
         parent = ClusterNode(
-            id=parent_cid, left=ci, right=cj, parent=-1,
-            size=ni.size + nj.size,
+            id=parent_cid, parent=-1, size=ni.size + nj.size,
             birth_lambda=lam, last_lambda=lam, stability=0.0,
             members=members
         )
         nodes.append(parent)
 
-        # link children -> parent
+        # lier enfants -> parent
         nodes[ci].parent = parent_cid
         nodes[cj].parent = parent_cid
 
-        # union-find structure
-        new_root, _ = uf.union(ri, rj)
-        point2cid[new_root] = parent_cid
+        # union-find
+        new_root = uf.union(ri, rj)
+        root2cid[new_root] = parent_cid
 
-    # final stability accumulation to lambda=0 for the root component(s)
-    # find cluster ids with no parent
+    # finir l'accumulation jusqu'à lambda=0 pour tout noeud sans parent
     root_ids = [nd.id for nd in nodes if nd.parent == -1]
     for rid in root_ids:
         nd = nodes[rid]
         nd.stability += nd.size * (nd.last_lambda - 0.0)
 
-    # If the MST produced multiple components (shouldn't, if MR is connected),
-    # we merge them virtually with lambda=0 to define a single root.
+    # s'il y a plusieurs racines (graphes disjoints), on insère une super-racine
     if len(root_ids) == 1:
-        root_cid = root_ids[0]
+        root_id = root_ids[0]
     else:
-        root_cid = next_cid; next_cid += 1
+        root_id = next_cid; next_cid += 1
         members = set().union(*[nodes[r].members for r in root_ids])
-        parent = ClusterNode(
-            id=root_cid, left=-1, right=-1, parent=-1,
-            size=len(members), birth_lambda=0.0, last_lambda=0.0,
-            stability=0.0, members=members
+        super_root = ClusterNode(
+            id=root_id, parent=-1, size=len(members),
+            birth_lambda=0.0, last_lambda=0.0, stability=0.0,
+            members=members
         )
-        nodes.append(parent)
+        nodes.append(super_root)
         for r in root_ids:
-            nodes[r].parent = root_cid
+            nodes[r].parent = root_id
 
-    return nodes, root_cid
-
-def _select_clusters_eom(nodes: List[ClusterNode], root_id: int,
-                         min_cluster_size: int, allow_single_cluster: bool) -> List[int]:
-    """
-    Simplified EOM: post-order, pick children if they have higher total stability than the parent,
-    otherwise pick the parent. Enforce min_cluster_size. Disallow selecting the artificial root
-    unless allow_single_cluster and it meets size.
-    """
-    # Build children list
-    children: Dict[int, List[int]] = {}
+    # construire parent -> enfants de manière sûre (sans cycles)
+    parent_to_children: Dict[int, List[int]] = {}
     for nd in nodes:
-        if nd.left != -1:
-            children.setdefault(nd.id, [])
-            children[nd.id] += [nd.left, nd.right]
         if nd.parent != -1:
-            children.setdefault(nd.parent, [])
+            parent_to_children.setdefault(nd.parent, []).append(nd.id)
 
-    # Post-order traversal to compute best stability sum
-    sys_stack = [root_id]
-    post = []
+    return nodes, root_id, parent_to_children
+
+
+# -------------------- sélection EOM (itérative) --------------------
+
+def _select_clusters_eom_iter(nodes: List[ClusterNode], root_id: int,
+                              parent_to_children: Dict[int, List[int]],
+                              min_cluster_size: int,
+                              allow_single_cluster: bool) -> List[int]:
+    """
+    EOM simplifiée, itérative:
+      - post-ordre calculé explicitement
+      - best_sum[u] = max(stab(u), somme best_sum des enfants)
+    """
+    # fabriquer un post-ordre itératif
+    stack = [root_id]
     seen = set()
-    while sys_stack:
-        u = sys_stack.pop()
+    post = []
+    while stack:
+        u = stack.pop()
         if u in seen:
             post.append(u)
             continue
         seen.add(u)
-        sys_stack.append(u)
-        for v in children.get(u, []):
-            sys_stack.append(v)
+        stack.append(u)
+        for v in parent_to_children.get(u, []):
+            stack.append(v)
 
     best_sum: Dict[int, float] = {}
     pick_children: Dict[int, bool] = {}
+
     for u in post:
         nd = nodes[u]
-        child_ids = children.get(u, [])
-        if not child_ids:
-            best_sum[u] = nd.stability if nd.size >= min_cluster_size else 0.0
+        ch = parent_to_children.get(u, [])
+        if not ch:
+            val = nd.stability if nd.size >= min_cluster_size else 0.0
+            best_sum[u] = val
             pick_children[u] = False
-            continue
-        # sum of children's bests
-        s_children = 0.0
-        for v in child_ids:
-            s_children += best_sum.get(v, 0.0)
-        self_val = nd.stability if nd.size >= min_cluster_size else 0.0
-        if s_children > self_val:
-            best_sum[u] = s_children
-            pick_children[u] = True
         else:
-            best_sum[u] = self_val
-            pick_children[u] = False
+            sum_children = 0.0
+            for v in ch:
+                sum_children += best_sum.get(v, 0.0)
+            self_val = nd.stability if nd.size >= min_cluster_size else 0.0
+            if sum_children > self_val:
+                best_sum[u] = sum_children
+                pick_children[u] = True
+            else:
+                best_sum[u] = self_val
+                pick_children[u] = False
 
-    # Recover selected cluster ids
+    # collecte sélective sans récursion
     selected: List[int] = []
-    def collect(u: int):
+    stack2 = [root_id]
+    while stack2:
+        u = stack2.pop()
         nd = nodes[u]
-        child_ids = children.get(u, [])
-        if not child_ids:
+        ch = parent_to_children.get(u, [])
+        if not ch:
             if nd.size >= min_cluster_size and nd.stability > 0:
                 selected.append(u)
-            return
+            continue
         if pick_children[u]:
-            for v in child_ids:
-                collect(v)
+            stack2.extend(ch)
         else:
             if nd.size >= min_cluster_size and nd.stability > 0:
                 selected.append(u)
 
-    collect(root_id)
-
-    # Filter root if not allowed
+    # on n'autorise pas la super-racine comme cluster unique sauf si demandé
     if not allow_single_cluster and root_id in selected:
-        selected.remove(root_id)
+        try:
+            selected.remove(root_id)
+        except ValueError:
+            pass
     return selected
 
+
 def _assign_labels_from_selection(n: int, nodes: List[ClusterNode], selected: List[int]) -> np.ndarray:
-    """Assign each point to the smallest selected cluster that contains it; others are noise (-1)."""
+    """Assigne chaque point au cluster sélectionné le plus spécifique; sinon -1."""
     labels = -np.ones(n, dtype=np.int32)
-    selected_set = set(selected)
-    # sort selected by cluster size ascending to assign the most specific first
+    # trier par taille croissante pour prioriser les plus spécifiques
     selected_sorted = sorted(selected, key=lambda cid: nodes[cid].size)
-    cur_label = 0
+    cur = 0
     for cid in selected_sorted:
         for p in nodes[cid].members:
             if labels[p] == -1:
-                labels[p] = cur_label
-        cur_label += 1
+                labels[p] = cur
+        cur += 1
     return labels
 
-# -------------------- public API --------------------
+
+# -------------------- API publique --------------------
 
 def hdbscan_from_sparse(
     D: csr_matrix,
@@ -305,56 +295,59 @@ def hdbscan_from_sparse(
     expZ: float = 2.0
 ) -> np.ndarray:
     """
-    Run a HDBSCAN-like clustering directly on a sparse CSR distance matrix.
+    HDBSCAN-like directement sur une CSR de distances.
 
-    Parameters
+    Paramètres
     ----------
-    D : csr_matrix
-        Sparse, symmetric distance graph (only neighbors present as edges).
-        Will be converted to float64 and symmetrized.
+    D : csr_matrix (n x n)
+        Graphe de distances (sparse, symétrique ou non; on symétrise).
     min_cluster_size : int
     min_samples : int
-        k for core-distances (k-th neighbor in the *sparse* neighborhood).
+        k pour les core-distances.
     allow_single_cluster : bool
     expZ : float
-        Apply d -> d**expZ before clustering (as in your pipeline).
+        Transformation d -> d**expZ avant clustering.
 
-    Returns
-    -------
-    labels : ndarray of shape (n_samples,)
-        Cluster labels; -1 for noise.
+    Retour
+    ------
+    labels : (n,)
+        -1 = bruit.
     """
     if not isinstance(D, csr_matrix):
         raise TypeError("D must be a scipy.sparse.csr_matrix")
     if D.shape[0] != D.shape[1]:
         raise ValueError("D must be square")
 
-    # keep float64 to satisfy low-level routines
+    # float64 partout
     D = D.astype(np.float64, copy=False)
-    # optional power transform
+
+    # puissance (ex: expZ=2)
     if expZ is not None and expZ != 1.0:
         D.data **= float(expZ)
 
-    # symmetrize defensively
+    # symétrie sûre
     D = _symmetrize_min_csr(D)
 
-    # restrict to largest connected component (you le fais déjà en amont normalement)
-    # SciPy's MST handles components independently; we proceed globally.
+    n = D.shape[0]
+    if n == 0 or D.nnz == 0:
+        return -np.ones(n, dtype=np.int32)
 
-    # core distances from sparse neighbors
+    # core distances sur voisins existants
     k = int(max(1, min_samples))
     core = _core_distances_from_csr(D, k)
 
-    # mutual reachability on sparse pattern
+    # mutual reachability sparse
     MR = _mutual_reachability_csr(D, core)
 
-    # MST edges
+    # MST
     edges = _mst_edges_from_sparse(MR)
     if len(edges) == 0:
-        return -np.ones(D.shape[0], dtype=np.int32)
+        return -np.ones(n, dtype=np.int32)
 
-    # build merge tree and select clusters
-    nodes, root_id = _build_cluster_tree_from_mst(D.shape[0], edges, min_cluster_size)
-    selected = _select_clusters_eom(nodes, root_id, min_cluster_size, allow_single_cluster)
-    labels = _assign_labels_from_selection(D.shape[0], nodes, selected)
+    # arbre + sélection EOM
+    nodes, root_id, parent_to_children = _build_tree_single_linkage(n, edges, min_cluster_size)
+    selected = _select_clusters_eom_iter(nodes, root_id, parent_to_children,
+                                         min_cluster_size=min_cluster_size,
+                                         allow_single_cluster=allow_single_cluster)
+    labels = _assign_labels_from_selection(n, nodes, selected)
     return labels
