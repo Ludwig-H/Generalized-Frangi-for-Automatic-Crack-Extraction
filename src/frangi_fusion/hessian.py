@@ -1,24 +1,46 @@
-
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 
 def to_gray(img: np.ndarray) -> np.ndarray:
+    # Convert to float32 in [0,1], robust to HxW or HxWxC (any C>=1)
     if img.ndim == 2:
-        return img.astype(np.float32)/255.0
+        g = img.astype(np.float32)
     elif img.ndim == 3:
-        g = img[..., :3].dot(np.array([0.2989, 0.5870, 0.1140], dtype=np.float32))
-        g = g.astype(np.float32)
-        g -= g.min()
-        if g.max() > 0:
-            g /= g.max()
-        return g
+        c = img.shape[2]
+        arr = img.astype(np.float32)
+        if c >= 3:
+            w = np.array([0.2989, 0.5870, 0.1140], dtype=np.float32)
+            g = arr[..., :3].dot(w)
+        elif c == 2:
+            g = arr.mean(axis=2)
+        else:
+            g = arr[..., 0]
     else:
         raise ValueError("Unsupported image shape")
+    g -= g.min()
+    if g.max() > 0:
+        g /= g.max()
+    return g
 
 def _hessian_at_sigma(gray: np.ndarray, sigma: float) -> Dict[str,np.ndarray]:
-    Hxx, Hxy, Hyy = hessian_matrix(gray, sigma=sigma, order='rc')
-    e1, e2 = hessian_matrix_eigvals(Hxx, Hxy, Hyy)
+    # Explicit to silence the FutureWarning and use the “Frangi” convention
+    H_elems = hessian_matrix(
+        gray,
+        sigma=float(sigma),
+        order='rc',
+        use_gaussian_derivatives=True  # <- explicite, stable
+    )
+    # Unpack for convenience
+    Hxx, Hxy, Hyy = H_elems
+
+    # Newer scikit-image expects a single arg; older expected 3 args.
+    try:
+        e1, e2 = hessian_matrix_eigvals(H_elems)
+    except TypeError:
+        e1, e2 = hessian_matrix_eigvals(Hxx, Hxy, Hyy)
+
+    # Orientation of principal curvature (for visualization)
     theta = 0.5 * np.arctan2(2*Hxy, (Hxx - Hyy) + 1e-12)
     return {"Hxx":Hxx, "Hxy":Hxy, "Hyy":Hyy, "e1":e1, "e2":e2, "theta":theta}
 
@@ -53,10 +75,6 @@ def compute_hessians_per_scale(modality_gray: np.ndarray, sigmas: List[float]) -
 
 def fuse_hessians_per_scale(hessians_by_modality: Dict[str, List[Dict[str,np.ndarray]]],
                             weights_by_modality: Dict[str, float]) -> List[Dict[str,np.ndarray]]:
-    '''
-    Fuse per scale: H_total_sigma = sum_m w_m * H_m_sigma.
-    Thetas are averaged by circular mean; e1,e2 recomputed from fused H to keep consistency.
-    '''
     sigmas = [Hd["sigma"] for Hd in list(hessians_by_modality.values())[0]]
     fused = []
     for sidx, sigma in enumerate(sigmas):
@@ -75,5 +93,6 @@ def fuse_hessians_per_scale(hessians_by_modality: Dict[str, List[Dict[str,np.nda
         lam2 = tr + disc
         theta = 0.5 * np.arctan2(2*b, (a - c) + 1e-12)
         spec = np.maximum(np.maximum(np.abs(lam1),np.abs(lam2)),1e-12)
-        fused.append({"Hxx":Hxx/spec, "Hxy":Hxy/spec, "Hyy":Hyy/spec, "e1":lam1/spec, "e2":lam2/spec, "theta":theta, "sigma":sigma})
+        fused.append({"Hxx":Hxx/spec, "Hxy":Hxy/spec, "Hyy":Hyy/spec,
+                      "e1":lam1/spec, "e2":lam2/spec, "theta":theta, "sigma":sigma})
     return fused
