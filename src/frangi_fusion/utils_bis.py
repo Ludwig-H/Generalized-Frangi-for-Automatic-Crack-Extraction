@@ -54,21 +54,21 @@ def to_gray_uint8(img):
         g /= g.max()
     return (g * 255).clip(0,255).astype(np.uint8)
 
-# ---------- monkey-patch repo utilities if present ----------
-try:
-    import .utils as U
-    import .hessian as H
-    # patch readers / grayscale
-    U._read_image = _read_image_any
-    U.to_gray_uint8 = to_gray_uint8
+# # ---------- monkey-patch repo utilities if present ----------
+# try:
+import .utils as U
+import .hessian as H
+# patch readers / grayscale
+U._read_image = _read_image_any
+U.to_gray_uint8 = to_gray_uint8
 
-    def _to_gray_float01(img):
-        g = to_gray_uint8(img).astype(np.float32) / 255.0
-        return g
-    H.to_gray = _to_gray_float01
-    reload(U); reload(H)
-except Exception as _e:
-    print("Patch local only (no package found). Proceeding with helper fns in notebook.")
+def _to_gray_float01(img):
+    g = to_gray_uint8(img).astype(np.float32) / 255.0
+    return g
+H.to_gray = _to_gray_float01
+reload(U); reload(H)
+# except Exception as _e:
+#     print("Patch local only (no package found). Proceeding with helper fns in notebook.")
 
 # ---------- optional: safer loader that skips broken modalities ----------
 import os, glob
