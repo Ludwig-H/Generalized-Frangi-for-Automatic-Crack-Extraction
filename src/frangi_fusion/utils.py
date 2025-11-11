@@ -11,26 +11,75 @@ def set_seed(seed: int = 42):
 def _is_image_file(p: str) -> bool:
     return p.lower().endswith((".png",".jpg",".jpeg",".tif",".tiff","bmp"))
 
-def to_gray_uint8(img: np.ndarray) -> np.ndarray:
+# def to_gray_uint8(img: np.ndarray) -> np.ndarray:
+#     if img.ndim == 2:
+#         g = img
+#     elif img.ndim == 3:
+#         # simple luminance
+#         g = img[..., :3].dot(np.array([0.2989, 0.5870, 0.1140]))
+#     else:
+#         raise ValueError("Unsupported image shape")
+#     g = g.astype(np.float32)
+#     g = g - g.min()
+#     if g.max() > 0:
+#         g = g / g.max()
+#     g = (g * 255.0).clip(0,255).astype(np.uint8)
+#     return g
+
+def to_gray_uint8(img):
+    # Accept HxW or HxWxC (any C>=1). For C>=3 use luminance on first 3, C==2 average.
     if img.ndim == 2:
-        g = img
+        g = img.astype(np.float32)
     elif img.ndim == 3:
-        # simple luminance
-        g = img[..., :3].dot(np.array([0.2989, 0.5870, 0.1140]))
+        c = img.shape[2]
+        arr = img.astype(np.float32)
+        if c >= 3:
+            w = np.array([0.2989, 0.5870, 0.1140], dtype=np.float32)
+            g = arr[..., :3].dot(w)
+        elif c == 2:
+            g = arr.mean(axis=2)
+        else:  # C==1 or weird
+            g = arr[..., 0]
     else:
         raise ValueError("Unsupported image shape")
-    g = g.astype(np.float32)
-    g = g - g.min()
+    g -= g.min()
     if g.max() > 0:
-        g = g / g.max()
-    g = (g * 255.0).clip(0,255).astype(np.uint8)
-    return g
+        g /= g.max()
+    return (g * 255).clip(0,255).astype(np.uint8)
 
-def _read_image(p: str) -> np.ndarray:
-    im = Image.open(p)
-    arr = np.array(im)
-    return arr
-
+# def _read_image(p: str) -> np.ndarray:
+#     im = Image.open(p)
+#     arr = np.array(im)
+#     return arr
+# ---------- robust readers / grayscale ----------
+def _read_image(path):
+    # 1) PIL
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            arr = np.array(im)
+            if arr.ndim == 3 and arr.shape[2] == 4:
+                arr = arr[..., :3]
+            return arr
+    except Exception:
+        pass
+    # 2) imageio
+    try:
+        arr = iio.imread(path)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[..., :3]
+        return arr
+    except Exception:
+        pass
+    # 3) skimage (tifffile backend)
+    try:
+        arr = ski_imread(path)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[..., :3]
+        return arr
+    except Exception as e:
+        raise e
+        
 def auto_discover_find_structure(root: str) -> Dict[str, List[str]]:
     '''
     Try to discover FIND dataset structure.
