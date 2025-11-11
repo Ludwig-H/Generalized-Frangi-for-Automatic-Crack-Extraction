@@ -1,5 +1,7 @@
+# src/frangi_fusion/hessian.py
+
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 
 def to_gray(img: np.ndarray) -> np.ndarray:
@@ -26,64 +28,55 @@ def to_gray(img: np.ndarray) -> np.ndarray:
         g /= g.max()
     return g
 
-def _order_by_abs(e1: np.ndarray, e2: np.ndarray) -> (np.ndarray, np.ndarray):
-    """
-    Ensure |e1| <= |e2| pixelwise by swapping when needed.
-    """
+def _order_by_abs(e1: np.ndarray, e2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Ensure |e1| <= |e2| pixelwise."""
     swap = np.abs(e1) > np.abs(e2)
     if np.any(swap):
-        e1_new = e1.copy()
-        e2_new = e2.copy()
-        e1_new[swap], e2_new[swap] = e2[swap], e1[swap]
-        return e1_new, e2_new
+        e1c, e2c = e1.copy(), e2.copy()
+        e1c[swap], e2c[swap] = e2[swap], e1[swap]
+        return e1c, e2c
     return e1, e2
 
 def _hessian_at_sigma(gray: np.ndarray, sigma: float) -> Dict[str, np.ndarray]:
     """
-    Compute Hessian with Gaussian derivatives and reflective boundaries
-    to avoid border artifacts. Eigenvalues are ordered by |.| so that |e1| <= |e2|.
+    Hessian with Gaussian derivatives; reflective boundaries to avoid edge artifacts.
+    Eigenvalues ordered so that |e1| <= |e2|.
     """
     Hxx, Hxy, Hyy = hessian_matrix(
         gray,
         sigma=float(sigma),
         order='rc',
-        use_gaussian_derivatives=True,  # explicit, stable
-        mode='reflect',                 # reduce border effects
+        use_gaussian_derivatives=True,
+        mode='reflect',
         cval=0.0
     )
-
-    # Newer scikit-image expects one argument; older versions accept three.
     try:
         e1, e2 = hessian_matrix_eigvals((Hxx, Hxy, Hyy))
     except TypeError:
         e1, e2 = hessian_matrix_eigvals(Hxx, Hxy, Hyy)
 
-    # Order by absolute value: |e1| <= |e2|
     e1, e2 = _order_by_abs(e1, e2)
-
-    # Orientation (principal curvature)
     theta = 0.5 * np.arctan2(2 * Hxy, (Hxx - Hyy) + 1e-12)
     return {"Hxx": Hxx, "Hxy": Hxy, "Hyy": Hyy, "e1": e1, "e2": e2, "theta": theta}
 
 def _spectral_norm(Hxx: np.ndarray, Hxy: np.ndarray, Hyy: np.ndarray) -> np.ndarray:
-    """
-    Spectral norm of a symmetric 2x2 matrix per pixel.
-    """
+    """Spectral norm of the 2x2 Hessian per pixel."""
     a, b, c = Hxx, Hxy, Hyy
     tr = (a + c) / 2.0
     disc = np.sqrt(((a - c) / 2.0) ** 2 + b ** 2)
-    lam1 = tr - disc
-    lam2 = tr + disc
-    spec = np.maximum(np.abs(lam1), np.abs(lam2))
+    l1 = tr - disc
+    l2 = tr + disc
+    spec = np.maximum(np.abs(l1), np.abs(l2))
     return np.maximum(spec, 1e-12)
 
 def normalize_hessian(Hd: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """
-    Normalize H by its spectral norm. Keep eigenvalues ordered by |.| (|e1| <= |e2|).
+    Normalize H and its eigenvalues by the spectral norm.
+    Keeps sign information intact and |e2| in [0,1].
     """
     spec = _spectral_norm(Hd["Hxx"], Hd["Hxy"], Hd["Hyy"])
-    e1 = Hd["e1"] / np.maximum(np.abs(Hd["e2"]), 1e-12)
-    e2 = Hd["e2"] / np.maximum(np.abs(Hd["e2"]), 1e-12)
+    e1 = Hd["e1"] / spec
+    e2 = Hd["e2"] / spec
     e1, e2 = _order_by_abs(e1, e2)
     return {
         "Hxx": Hd["Hxx"] / spec,
@@ -109,7 +102,7 @@ def fuse_hessians_per_scale(
 ) -> List[Dict[str, np.ndarray]]:
     """
     Per-scale fusion: H_total_sigma = sum_m w_m * H_m_sigma (then re-normalize).
-    Eigenvalues are re-computed from the fused Hessian and ordered by |.| (|e1| <= |e2|).
+    Eigenvalues are recomputed from the fused H and ordered by |.| (|e1|<=|e2|).
     """
     sigmas = [Hd["sigma"] for Hd in list(hessians_by_modality.values())[0]]
     fused = []
@@ -123,17 +116,16 @@ def fuse_hessians_per_scale(
             else:
                 Hxx += w * Hd["Hxx"]; Hxy += w * Hd["Hxy"]; Hyy += w * Hd["Hyy"]
 
-        # Recompute fused eigenvalues, order by |.|, normalize
         a, b, c = Hxx, Hxy, Hyy
         tr = (a + c) / 2.0
         disc = np.sqrt(((a - c) / 2.0) ** 2 + b ** 2)
-        lam1 = tr - disc
-        lam2 = tr + disc
-        lam1, lam2 = _order_by_abs(lam1, lam2)
+        l1 = tr - disc
+        l2 = tr + disc
+        l1, l2 = _order_by_abs(l1, l2)
         theta = 0.5 * np.arctan2(2 * b, (a - c) + 1e-12)
-        spec = np.maximum(np.maximum(np.abs(lam1), np.abs(lam2)), 1e-12)
+        spec = np.maximum(np.maximum(np.abs(l1), np.abs(l2)), 1e-12)
         fused.append({
             "Hxx": Hxx / spec, "Hxy": Hxy / spec, "Hyy": Hyy / spec,
-            "e1": lam1 / spec, "e2": lam2 / spec, "theta": theta, "sigma": sigma
+            "e1": l1 / spec,   "e2": l2 / spec,   "theta": theta, "sigma": sigma
         })
     return fused
