@@ -1,14 +1,13 @@
-
 import numpy as np
 from typing import List, Tuple, Dict
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree, dijkstra
 
 def mst_on_cluster(D: csr_matrix, cluster_idx: np.ndarray) -> csr_matrix:
-    '''
+    """
     Compute MST on the subgraph induced by nodes in cluster_idx.
-    Return the MST as a CSR matrix in the original indexing order restricted to the cluster (0..k-1).
-    '''
+    Return the MST as a CSR matrix indexed 0..(k-1) (local indexing).
+    """
     sub = D[cluster_idx][:, cluster_idx]
     sub_sym = sub + sub.T
     mst = minimum_spanning_tree(sub_sym)
@@ -16,58 +15,103 @@ def mst_on_cluster(D: csr_matrix, cluster_idx: np.ndarray) -> csr_matrix:
     return mst.tocsr()
 
 def _farthest_first_kcenters(mst: csr_matrix, k: int) -> List[int]:
+    """Greedy farthest-first on tree metric."""
     n = mst.shape[0]
+    if n == 0:
+        return []
     centers = [0]
-    from scipy.sparse.csgraph import dijkstra
-    dist = dijkstra(mst, directed=False, return_predecessors=False, indices=centers)[0]
-    for _ in range(1,k):
+    dist = dijkstra(mst, directed=False, indices=centers)[0]
+    for _ in range(1, k):
         nxt = int(np.argmax(dist))
         centers.append(nxt)
-        d_new = dijkstra(mst, directed=False, return_predecessors=False, indices=[nxt])[0]
-        dist = np.minimum(dist, d_new)
+        dn = dijkstra(mst, directed=False, indices=[nxt])[0]
+        dist = np.minimum(dist, dn)
     return centers
 
 def kcenters_on_tree(mst: csr_matrix, k: int, objective: str = "max") -> List[int]:
+    """Return k centers on the MST."""
     k = max(1, int(k))
-    if k >= mst.shape[0]:
-        return list(range(mst.shape[0]))
+    n = mst.shape[0]
+    if k >= n:
+        return list(range(n))
     return _farthest_first_kcenters(mst, k)
 
-def _edges_set_from_path(predecessors: np.ndarray, src: int, dst: int):
-    path = []
+def _path_nodes_from_predecessors(pred: np.ndarray, src: int, dst: int) -> List[int]:
+    """Reconstruct path (node indices) from src to dst using a predecessor array."""
+    path = [dst]
     u = dst
     while u != src and u != -9999:
-        v = predecessors[u]
-        if v < 0: break
-        a,b = sorted((u,v))
-        path.append((a,b))
-        u = v
+        u = pred[u]
+        if u < 0:
+            break
+        path.append(u)
+    if path[-1] != src:
+        return []  # disconnected
     return path[::-1]
 
+def paths_between_centers(mst: csr_matrix, centers: List[int]) -> Dict[Tuple[int,int], List[int]]:
+    """
+    For each unordered pair of centers (i<j) return the list of node indices along
+    the path on the MST between them (local indexing).
+    """
+    paths: Dict[Tuple[int,int], List[int]] = {}
+    n = mst.shape[0]
+    for idx, src in enumerate(centers):
+        dist, pred = dijkstra(mst, directed=False, return_predecessors=True, indices=src)
+        for dst in centers[idx+1:]:
+            path = _path_nodes_from_predecessors(pred, src, dst)
+            if path:
+                paths[(src, dst)] = path
+    return paths
+
+def skeleton_from_center_paths(paths: Dict[Tuple[int,int], List[int]],
+                               coords: np.ndarray,
+                               mst: csr_matrix,
+                               weight_mode: str = "edge") -> np.ndarray:
+    """
+    Convert center-to-center paths into a segment list of edges in image coordinates.
+    Returns an array of shape (E, 5): [r0, c0, r1, c1, w]
+    where w is the MST edge weight between the two pixels of the segment.
+    """
+    segs = []
+    for (u, v), path in paths.items():
+        if len(path) < 2:
+            continue
+        for a, b in zip(path[:-1], path[1:]):
+            w = float(mst[a, b])
+            if w == 0:
+                w = float(mst[b, a])
+            r0, c0 = coords[a]
+            r1, c1 = coords[b]
+            segs.append([int(r0), int(c0), int(r1), int(c1), float(w)])
+    if len(segs) == 0:
+        return np.zeros((0, 5), dtype=np.float32)
+    segs = np.array(segs, dtype=np.float32)
+    return segs
+
 def fault_graph_from_mst_and_kcenters(mst: csr_matrix, centers: List[int], weight_agg: str = "mean") -> csr_matrix:
-    '''
-    Build a small tree connecting the k-centers by reusing MST paths.
-    Weight of an edge between centers is the mean/median of MST edge weights along the path.
-    '''
+    """
+    Legacy small graph between centers using MST paths (kept for compatibility).
+    """
     from scipy.sparse import csr_matrix
     n = mst.shape[0]
     if len(centers) <= 1:
-        return csr_matrix((n,n))
+        return csr_matrix((n, n))
     rows, cols, data = [], [], []
-    from scipy.sparse.csgraph import dijkstra
     for i, src in enumerate(centers):
         dist, pred = dijkstra(mst, directed=False, return_predecessors=True, indices=src)
         for dst in centers[i+1:]:
-            path_edges = _edges_set_from_path(pred, src, dst)
-            if not path_edges:
+            path = _path_nodes_from_predecessors(pred, src, dst)
+            if not path or len(path) < 2:
                 continue
-            w = []
-            for a,b in path_edges:
-                wa = mst[a,b]
-                if wa == 0: wa = mst[b,a]
-                w.append(float(wa))
-            val = np.median(w) if weight_agg=="median" else np.mean(w)
+            wts = []
+            for a, b in zip(path[:-1], path[1:]):
+                w = mst[a, b]
+                if w == 0:
+                    w = mst[b, a]
+                wts.append(float(w))
+            val = np.median(wts) if weight_agg == "median" else np.mean(wts)
             rows.append(src); cols.append(dst); data.append(val)
-    G = csr_matrix((data, (rows, cols)), shape=(n,n))
+    G = csr_matrix((data, (rows, cols)), shape=(n, n))
     G = G + G.T
     return G
