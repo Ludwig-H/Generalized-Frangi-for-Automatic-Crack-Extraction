@@ -26,17 +26,29 @@ def to_gray(img: np.ndarray) -> np.ndarray:
         g /= g.max()
     return g
 
+def _order_by_abs(e1: np.ndarray, e2: np.ndarray) -> (np.ndarray, np.ndarray):
+    """
+    Ensure |e1| <= |e2| pixelwise by swapping when needed.
+    """
+    swap = np.abs(e1) > np.abs(e2)
+    if np.any(swap):
+        e1_new = e1.copy()
+        e2_new = e2.copy()
+        e1_new[swap], e2_new[swap] = e2[swap], e1[swap]
+        return e1_new, e2_new
+    return e1, e2
+
 def _hessian_at_sigma(gray: np.ndarray, sigma: float) -> Dict[str, np.ndarray]:
     """
     Compute Hessian with Gaussian derivatives and reflective boundaries
-    to avoid border artifacts.
+    to avoid border artifacts. Eigenvalues are ordered by |.| so that |e1| <= |e2|.
     """
     Hxx, Hxy, Hyy = hessian_matrix(
         gray,
         sigma=float(sigma),
         order='rc',
-        use_gaussian_derivatives=True,  # explicit to silence FutureWarning
-        mode='reflect',                 # <- reduce border effects
+        use_gaussian_derivatives=True,  # explicit, stable
+        mode='reflect',                 # reduce border effects
         cval=0.0
     )
 
@@ -46,6 +58,10 @@ def _hessian_at_sigma(gray: np.ndarray, sigma: float) -> Dict[str, np.ndarray]:
     except TypeError:
         e1, e2 = hessian_matrix_eigvals(Hxx, Hxy, Hyy)
 
+    # Order by absolute value: |e1| <= |e2|
+    e1, e2 = _order_by_abs(e1, e2)
+
+    # Orientation (principal curvature)
     theta = 0.5 * np.arctan2(2 * Hxy, (Hxx - Hyy) + 1e-12)
     return {"Hxx": Hxx, "Hxy": Hxy, "Hyy": Hyy, "e1": e1, "e2": e2, "theta": theta}
 
@@ -62,13 +78,19 @@ def _spectral_norm(Hxx: np.ndarray, Hxy: np.ndarray, Hyy: np.ndarray) -> np.ndar
     return np.maximum(spec, 1e-12)
 
 def normalize_hessian(Hd: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    Normalize H by its spectral norm. Keep eigenvalues ordered by |.| (|e1| <= |e2|).
+    """
     spec = _spectral_norm(Hd["Hxx"], Hd["Hxy"], Hd["Hyy"])
+    e1 = Hd["e1"] / np.maximum(np.abs(Hd["e2"]), 1e-12)
+    e2 = Hd["e2"] / np.maximum(np.abs(Hd["e2"]), 1e-12)
+    e1, e2 = _order_by_abs(e1, e2)
     return {
         "Hxx": Hd["Hxx"] / spec,
         "Hxy": Hd["Hxy"] / spec,
         "Hyy": Hd["Hyy"] / spec,
-        "e1":  Hd["e1"] / np.maximum(np.abs(Hd["e2"]), 1e-12),
-        "e2":  Hd["e2"] / np.maximum(np.abs(Hd["e2"]), 1e-12),
+        "e1":  e1,
+        "e2":  e2,
         "theta": Hd["theta"]
     }
 
@@ -87,6 +109,7 @@ def fuse_hessians_per_scale(
 ) -> List[Dict[str, np.ndarray]]:
     """
     Per-scale fusion: H_total_sigma = sum_m w_m * H_m_sigma (then re-normalize).
+    Eigenvalues are re-computed from the fused Hessian and ordered by |.| (|e1| <= |e2|).
     """
     sigmas = [Hd["sigma"] for Hd in list(hessians_by_modality.values())[0]]
     fused = []
@@ -99,12 +122,14 @@ def fuse_hessians_per_scale(
                 Hxx = w * Hd["Hxx"]; Hxy = w * Hd["Hxy"]; Hyy = w * Hd["Hyy"]
             else:
                 Hxx += w * Hd["Hxx"]; Hxy += w * Hd["Hxy"]; Hyy += w * Hd["Hyy"]
-        # re-normalize fused Hessian and recompute eigs/orientation
+
+        # Recompute fused eigenvalues, order by |.|, normalize
         a, b, c = Hxx, Hxy, Hyy
         tr = (a + c) / 2.0
         disc = np.sqrt(((a - c) / 2.0) ** 2 + b ** 2)
         lam1 = tr - disc
         lam2 = tr + disc
+        lam1, lam2 = _order_by_abs(lam1, lam2)
         theta = 0.5 * np.arctan2(2 * b, (a - c) + 1e-12)
         spec = np.maximum(np.maximum(np.abs(lam1), np.abs(lam2)), 1e-12)
         fused.append({
