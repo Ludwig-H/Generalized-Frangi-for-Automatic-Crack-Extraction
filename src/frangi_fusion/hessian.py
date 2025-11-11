@@ -3,7 +3,10 @@ from typing import Dict, List
 from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 
 def to_gray(img: np.ndarray) -> np.ndarray:
-    # Convert to float32 in [0,1], robust to HxW or HxWxC (any C>=1)
+    """
+    Convert to float32 in [0,1]. Accepts HxW or HxWxC (any C>=1).
+    For C>=3 uses luminance on first 3 channels; for C==2 averages channels.
+    """
     if img.ndim == 2:
         g = img.astype(np.float32)
     elif img.ndim == 3:
@@ -23,48 +26,53 @@ def to_gray(img: np.ndarray) -> np.ndarray:
         g /= g.max()
     return g
 
-def _hessian_at_sigma(gray: np.ndarray, sigma: float) -> Dict[str,np.ndarray]:
-    # Explicit to silence the FutureWarning and use the “Frangi” convention
-    H_elems = hessian_matrix(
+def _hessian_at_sigma(gray: np.ndarray, sigma: float) -> Dict[str, np.ndarray]:
+    """
+    Compute Hessian with Gaussian derivatives and reflective boundaries
+    to avoid border artifacts.
+    """
+    Hxx, Hxy, Hyy = hessian_matrix(
         gray,
         sigma=float(sigma),
         order='rc',
-        use_gaussian_derivatives=True  # <- explicite, stable
+        use_gaussian_derivatives=True,  # explicit to silence FutureWarning
+        mode='reflect',                 # <- reduce border effects
+        cval=0.0
     )
-    # Unpack for convenience
-    Hxx, Hxy, Hyy = H_elems
 
-    # Newer scikit-image expects a single arg; older expected 3 args.
+    # Newer scikit-image expects one argument; older versions accept three.
     try:
-        e1, e2 = hessian_matrix_eigvals(H_elems)
+        e1, e2 = hessian_matrix_eigvals((Hxx, Hxy, Hyy))
     except TypeError:
         e1, e2 = hessian_matrix_eigvals(Hxx, Hxy, Hyy)
 
-    # Orientation of principal curvature (for visualization)
-    theta = 0.5 * np.arctan2(2*Hxy, (Hxx - Hyy) + 1e-12)
-    return {"Hxx":Hxx, "Hxy":Hxy, "Hyy":Hyy, "e1":e1, "e2":e2, "theta":theta}
+    theta = 0.5 * np.arctan2(2 * Hxy, (Hxx - Hyy) + 1e-12)
+    return {"Hxx": Hxx, "Hxy": Hxy, "Hyy": Hyy, "e1": e1, "e2": e2, "theta": theta}
 
-def _spectral_norm(Hxx, Hxy, Hyy) -> np.ndarray:
+def _spectral_norm(Hxx: np.ndarray, Hxy: np.ndarray, Hyy: np.ndarray) -> np.ndarray:
+    """
+    Spectral norm of a symmetric 2x2 matrix per pixel.
+    """
     a, b, c = Hxx, Hxy, Hyy
-    tr = (a + c)/2.0
-    disc = np.sqrt(((a - c)/2.0)**2 + b**2)
+    tr = (a + c) / 2.0
+    disc = np.sqrt(((a - c) / 2.0) ** 2 + b ** 2)
     lam1 = tr - disc
     lam2 = tr + disc
     spec = np.maximum(np.abs(lam1), np.abs(lam2))
     return np.maximum(spec, 1e-12)
 
-def normalize_hessian(Hd: Dict[str,np.ndarray]) -> Dict[str,np.ndarray]:
+def normalize_hessian(Hd: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     spec = _spectral_norm(Hd["Hxx"], Hd["Hxy"], Hd["Hyy"])
     return {
-        "Hxx": Hd["Hxx"]/spec,
-        "Hxy": Hd["Hxy"]/spec,
-        "Hyy": Hd["Hyy"]/spec,
-        "e1": Hd["e1"]/np.maximum(np.abs(Hd["e2"]),1e-12),
-        "e2": Hd["e2"]/np.maximum(np.abs(Hd["e2"]),1e-12),
+        "Hxx": Hd["Hxx"] / spec,
+        "Hxy": Hd["Hxy"] / spec,
+        "Hyy": Hd["Hyy"] / spec,
+        "e1":  Hd["e1"] / np.maximum(np.abs(Hd["e2"]), 1e-12),
+        "e2":  Hd["e2"] / np.maximum(np.abs(Hd["e2"]), 1e-12),
         "theta": Hd["theta"]
     }
 
-def compute_hessians_per_scale(modality_gray: np.ndarray, sigmas: List[float]) -> List[Dict[str,np.ndarray]]:
+def compute_hessians_per_scale(modality_gray: np.ndarray, sigmas: List[float]) -> List[Dict[str, np.ndarray]]:
     out = []
     for s in sigmas:
         Hd = _hessian_at_sigma(modality_gray, s)
@@ -73,8 +81,13 @@ def compute_hessians_per_scale(modality_gray: np.ndarray, sigmas: List[float]) -
         out.append(Hd)
     return out
 
-def fuse_hessians_per_scale(hessians_by_modality: Dict[str, List[Dict[str,np.ndarray]]],
-                            weights_by_modality: Dict[str, float]) -> List[Dict[str,np.ndarray]]:
+def fuse_hessians_per_scale(
+    hessians_by_modality: Dict[str, List[Dict[str, np.ndarray]]],
+    weights_by_modality: Dict[str, float]
+) -> List[Dict[str, np.ndarray]]:
+    """
+    Per-scale fusion: H_total_sigma = sum_m w_m * H_m_sigma (then re-normalize).
+    """
     sigmas = [Hd["sigma"] for Hd in list(hessians_by_modality.values())[0]]
     fused = []
     for sidx, sigma in enumerate(sigmas):
@@ -83,16 +96,19 @@ def fuse_hessians_per_scale(hessians_by_modality: Dict[str, List[Dict[str,np.nda
             w = float(weights_by_modality.get(mod, 1.0))
             Hd = lst[sidx]
             if Hxx is None:
-                Hxx = w*Hd["Hxx"]; Hxy = w*Hd["Hxy"]; Hyy = w*Hd["Hyy"]
+                Hxx = w * Hd["Hxx"]; Hxy = w * Hd["Hxy"]; Hyy = w * Hd["Hyy"]
             else:
-                Hxx += w*Hd["Hxx"]; Hxy += w*Hd["Hxy"]; Hyy += w*Hd["Hyy"]
-        a,b,c = Hxx, Hxy, Hyy
-        tr = (a + c)/2.0
-        disc = np.sqrt(((a - c)/2.0)**2 + b**2)
+                Hxx += w * Hd["Hxx"]; Hxy += w * Hd["Hxy"]; Hyy += w * Hd["Hyy"]
+        # re-normalize fused Hessian and recompute eigs/orientation
+        a, b, c = Hxx, Hxy, Hyy
+        tr = (a + c) / 2.0
+        disc = np.sqrt(((a - c) / 2.0) ** 2 + b ** 2)
         lam1 = tr - disc
         lam2 = tr + disc
-        theta = 0.5 * np.arctan2(2*b, (a - c) + 1e-12)
-        spec = np.maximum(np.maximum(np.abs(lam1),np.abs(lam2)),1e-12)
-        fused.append({"Hxx":Hxx/spec, "Hxy":Hxy/spec, "Hyy":Hyy/spec,
-                      "e1":lam1/spec, "e2":lam2/spec, "theta":theta, "sigma":sigma})
+        theta = 0.5 * np.arctan2(2 * b, (a - c) + 1e-12)
+        spec = np.maximum(np.maximum(np.abs(lam1), np.abs(lam2)), 1e-12)
+        fused.append({
+            "Hxx": Hxx / spec, "Hxy": Hxy / spec, "Hyy": Hyy / spec,
+            "e1": lam1 / spec, "e2": lam2 / spec, "theta": theta, "sigma": sigma
+        })
     return fused
